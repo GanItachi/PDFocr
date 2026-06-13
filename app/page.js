@@ -1,306 +1,1103 @@
 "use client";
 
-// Copia — interface "copie d'étudiant".
-// Logique identique à la v2.3 (lots dynamiques, recompression, replis 429/503/réseau).
+import { useEffect, useMemo, useRef, useState } from "react";
+import Sidebar from "../components/Sidebar";
+import Dropzone from "../components/Dropzone";
+import Workbench from "../components/Workbench";
+import CorrectionPanel from "../components/CorrectionPanel";
+import AddItemModal from "../components/AddItemModal";
+import EditItemModal from "../components/EditItemModal";
+import QuizPanel from "../components/QuizPanel";
+import Dashboard from "../components/Dashboard";
+import ToolsPanel from "../components/ToolsPanel";
+import HelpModal from "../components/HelpModal";
+import BatchImportModal from "../components/BatchImportModal";
+import BatchSummaryModal from "../components/BatchSummaryModal";
+import Settings from "../components/Settings";
+import WelcomeModal from "../components/WelcomeModal";
+import {
+  getUserKeys,
+  userKeyHeaders,
+  isOnboardingDone,
+  markOnboardingDone,
+} from "../lib/keys";
+import {
+  buildProfAnalysisPrompt,
+  buildTdsRankingPrompt,
+  buildRevisionPlanPrompt,
+  buildQuizExportPrompt,
+} from "../lib/prompts";
+import {
+  exportBaseAsZip,
+  importBaseFromZip,
+  downloadBlob,
+} from "../lib/export";
+import {
+  collectFromDataTransfer,
+  collectFromFileList,
+  collectFromZip,
+  parseFolderStructure,
+} from "../lib/batch";
+import { renderPdf, renderImage, shrinkImage } from "../lib/pdf";
+import { loadState, saveState } from "../lib/storage";
+import {
+  addItem,
+  getItem,
+  updateItem,
+  deleteItem,
+  listItems,
+  findByGbakiRef,
+} from "../lib/db";
+import { classifyDocument, quizQuestion, quizEvaluate } from "../lib/ai";
 
-import { useMemo, useRef, useState } from "react";
-import { buildCorrectionPrompt } from "../lib/prompts";
-
-const MODES = [
-  { key: "resume", label: "Résumé structuré du cours" },
-  { key: "fiche", label: "Fiche de révision" },
-  { key: "quiz", label: "Quiz d'entraînement" },
-  { key: "question", label: "Questions / réponses" },
-  { key: "libre", label: "Instruction libre" },
-];
-
-const PROVIDERS = [
-  { key: "gemini", label: "Gemini Flash (Google)" },
-  { key: "groq", label: "Llama 3.3 70B (Groq)" },
-  { key: "mistral", label: "Mistral Small" },
-  { key: "openrouter", label: "Modèle gratuit (OpenRouter)" },
-];
-
+const QUIZ_TOTAL = 8;
 const BATCH_SIZE = 2;
 const DELAY_MS = 4500;
-const TARGET_WIDTH = 2000;
 const MAX_PAYLOAD = 3_000_000;
+const OCR_CHAIN = ["gemini", "gemini-lite", "groq", "openrouter"];
+const normalizeType = (t) => (t === "sujet" ? "examen" : t);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function shrinkImage(dataUrl, factor = 0.8, quality = 0.78) {
-  const img = await new Promise((res, rej) => {
-    const im = new Image();
-    im.onload = () => res(im);
-    im.onerror = () => rej(new Error("Image illisible"));
-    im.src = dataUrl;
+function sleep(ms, signal) {
+  return new Promise((res, rej) => {
+    if (signal?.aborted) return rej(new DOMException("Annulé", "AbortError"));
+    const t = setTimeout(res, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(t);
+      rej(new DOMException("Annulé", "AbortError"));
+    });
   });
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(img.width * factor);
-  canvas.height = Math.round(img.height * factor);
-  canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/jpeg", quality);
 }
 
-/* Icônes minimales (SVG inline : zéro dépendance) */
-const I = {
-  up: (
-    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M12 17V5M6 11l6-6 6 6" /><path d="M4 19h16" />
-    </svg>
-  ),
-  copy: (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-      <rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V5a2 2 0 0 1 2-2h10" />
-    </svg>
-  ),
-  dl: (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-      <path d="M12 4v12M6 12l6 6 6-6" /><path d="M4 20h16" />
-    </svg>
-  ),
-  out: (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-      <path d="M14 4h6v6M20 4l-9 9" /><path d="M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5" />
-    </svg>
-  ),
-};
+async function migrateLegacyCache(gbakiManifest) {
+  if (typeof window === "undefined") return 0;
+  const prefix = "copia:gbaki:";
+  const keys = Object.keys(localStorage).filter((k) => k.startsWith(prefix));
+  if (keys.length === 0) return 0;
+  let n = 0;
+  for (const k of keys) {
+    const id = k.slice(prefix.length);
+    try {
+      const raw = localStorage.getItem(k);
+      if (!raw) continue;
+      const data = JSON.parse(raw);
+      const exists = await findByGbakiRef(id);
+      if (!exists && data?.markdown) {
+        const m = gbakiManifest?.find((it) => it.id === id);
+        await addItem({
+          matiere: m?.matiere || "Sans matière",
+          type: m?.type || "cours",
+          titre: m?.titre || id,
+          annee: m?.annee || "",
+          markdown: data.markdown,
+          sourceImages: data.sourceImages || [],
+          source: "gbaki",
+          gbakiRef: id,
+          createdAt: data.ts || Date.now(),
+        });
+        n++;
+      }
+      localStorage.removeItem(k);
+    } catch {
+      /* on continue */
+    }
+  }
+  return n;
+}
 
 export default function Home() {
+  const [subject, setSubject] = useState(
+    "mathématiques avancées, statistiques et économie",
+  );
+  const [attempt, setAttempt] = useState("");
+  const [sel, setSel] = useState([]);
+  const [currentItemId, setCurrentItemId] = useState(null);
+  const [hydrated, setHydrated] = useState(false);
+  const [markdown, setMarkdown] = useState("");
+  const [sourceImages, setSourceImages] = useState([]);
   const [status, setStatus] = useState("");
   const [progress, setProgress] = useState(0);
   const [busy, setBusy] = useState(false);
   const [verifyPass, setVerifyPass] = useState(true);
-  const [markdown, setMarkdown] = useState("");
-  const [over, setOver] = useState(false);
+  const [autoVerifyDisabled, setAutoVerifyDisabled] = useState(false);
+  const [gbaki, setGbaki] = useState(null);
+  const [baseItems, setBaseItems] = useState([]);
+  const [studyPrompt, setStudyPrompt] = useState("");
+  const [studyToolLabel, setStudyToolLabel] = useState("");
+  const [gbakiStatus, setGbakiStatus] = useState("");
+  const [addModal, setAddModal] = useState(null);
+  const [editModal, setEditModal] = useState(null);
+  const [quiz, setQuiz] = useState(null);
+  const [batchModal, setBatchModal] = useState(null);
+  const [batchProgress, setBatchProgress] = useState(null);
+  const [batchSummary, setBatchSummary] = useState(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [lastOpenedItemId, setLastOpenedItemId] = useState(null);
+  const [userKeys, setUserKeysState] = useState({
+    gemini: "",
+    groq: "",
+    openrouter: "",
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsFocus, setSettingsFocus] = useState(null);
+  const [welcomeOpen, setWelcomeOpen] = useState(false);
+  const [saturatedShared, setSaturatedShared] = useState(false);
+  const [copied, setCopied] = useState("");
 
-  const [provider, setProvider] = useState("gemini");
-  const [mode, setMode] = useState("resume");
-  const [question, setQuestion] = useState("");
-  const [chat, setChat] = useState([]);
-  const [streaming, setStreaming] = useState(false);
+  const abortRef = useRef(null);
+  const count429 = useRef(0);
+  const lastErrorRef = useRef("");
 
-  const [subject, setSubject] = useState("mathématiques avancées, statistiques et économie");
-  const [attempt, setAttempt] = useState("");
-  const [copied, setCopied] = useState(false);
-
-  const fileRef = useRef(null);
-
-  const correctionPrompt = useMemo(
-    () => (markdown ? buildCorrectionPrompt(markdown, { attempt, subject }) : ""),
-    [markdown, attempt, subject]
-  );
-
-  /* ---------- fichier -> images ---------- */
-  async function fileToImages(file, onPage) {
-    if (file.type === "application/pdf") {
-      const pdfjs = await import("pdfjs-dist");
-      pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
-      const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
-      const images = [];
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const base = page.getViewport({ scale: 1 });
-        const scale = Math.min(3, TARGET_WIDTH / base.width);
-        const viewport = page.getViewport({ scale });
-        const canvas = document.createElement("canvas");
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-        images.push(canvas.toDataURL("image/jpeg", 0.85));
-        onPage?.(i, pdf.numPages);
-      }
-      return images;
-    }
-    const bmp = await createImageBitmap(file);
-    const scale = Math.min(1.5, TARGET_WIDTH / bmp.width);
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.round(bmp.width * scale);
-    canvas.height = Math.round(bmp.height * scale);
-    canvas.getContext("2d").drawImage(bmp, 0, 0, canvas.width, canvas.height);
-    return [canvas.toDataURL("image/jpeg", 0.85)];
+  async function reloadKeys() {
+    const k = await getUserKeys();
+    setUserKeysState(k);
   }
 
-  /* ---------- pipeline OCR ---------- */
-  async function handleFiles(fileList) {
-    const files = Array.from(fileList || []);
-    if (!files.length) return;
-    setBusy(true);
-    setMarkdown("");
-    setChat([]);
-    setProgress(0);
-    try {
-      setStatus("Préparation des pages…");
-      let images = [];
-      for (const f of files) {
-        images = images.concat(
-          await fileToImages(f, (i, n) => setStatus(`Rendu : page ${i}/${n} de ${f.name}`))
+  const matiereSuggestions = useMemo(() => {
+    const set = new Set();
+    for (const it of baseItems) if (it.matiere) set.add(it.matiere);
+    for (const it of gbaki || []) if (it.matiere) set.add(it.matiere);
+    return [...set].sort();
+  }, [baseItems, gbaki]);
+
+  const currentItem = useMemo(
+    () => baseItems.find((it) => it.id === currentItemId) || null,
+    [baseItems, currentItemId],
+  );
+
+  useEffect(() => {
+    (async () => {
+      const s = loadState();
+      if (typeof s.subject === "string" && s.subject) setSubject(s.subject);
+      if (typeof s.attempt === "string") setAttempt(s.attempt);
+      if (Array.isArray(s.sel)) {
+        setSel(
+          s.sel
+            .filter((id) => typeof id === "string" && id)
+            .map((id) => (id.includes(":") ? id : `gbaki:${id}`)),
         );
       }
-
-      for (let i = 0; i < images.length; i++) {
-        let guard = 0;
-        while (images[i].length > MAX_PAYLOAD && guard < 3) {
-          setStatus(`Page ${i + 1} trop lourde, recompression…`);
-          images[i] = await shrinkImage(images[i]);
-          guard++;
+      if (typeof s.currentItemId === "string") {
+        const it = await getItem(s.currentItemId);
+        if (it) {
+          setCurrentItemId(it.id);
+          setMarkdown(it.markdown || "");
+          setSourceImages(it.sourceImages || []);
         }
       }
+      if (typeof s.lastOpenedItemId === "string") {
+        setLastOpenedItemId(s.lastOpenedItemId);
+      }
+      await reloadKeys();
+      const done = await isOnboardingDone();
+      if (!done) setWelcomeOpen(true);
+      setHydrated(true);
+    })();
+  }, []);
 
-      const batches = [];
-      let cur = [];
-      let curSize = 0;
-      for (const img of images) {
-        if (cur.length && (cur.length >= BATCH_SIZE || curSize + img.length > MAX_PAYLOAD)) {
-          batches.push(cur);
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch("/gbaki/index.json");
+        const d = r.ok ? await r.json() : { items: [] };
+        const items = Array.isArray(d.items) ? d.items : [];
+        setGbaki(items);
+        await migrateLegacyCache(items);
+        setBaseItems(await listItems());
+      } catch {
+        setGbaki([]);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated || busy) return;
+    const t = setTimeout(async () => {
+      saveState({ subject, attempt, sel, currentItemId });
+      if (currentItemId && markdown.trim()) {
+        await updateItem(currentItemId, { markdown, sourceImages });
+        setBaseItems(await listItems());
+      }
+    }, 800);
+    return () => clearTimeout(t);
+  }, [
+    markdown,
+    subject,
+    attempt,
+    sel,
+    currentItemId,
+    sourceImages,
+    hydrated,
+    busy,
+  ]);
+
+  function toggleSel(sid) {
+    setSel((s) => (s.includes(sid) ? s.filter((x) => x !== sid) : [...s, sid]));
+  }
+  function clearSelection() {
+    setSel([]);
+  }
+  function cancelOcr() {
+    abortRef.current?.abort();
+  }
+
+  async function refreshBase() {
+    setBaseItems(await listItems());
+  }
+
+  async function handleFolderOrZip(source) {
+    try {
+      let entries = [];
+      if (source.zipFile) {
+        setGbakiStatus("Lecture du dossier…");
+        entries = await collectFromZip(source.zipFile);
+      } else if (source.fileList) {
+        entries = collectFromFileList(source.fileList);
+      } else if (source.dataTransfer) {
+        entries = await collectFromDataTransfer(source.dataTransfer);
+        if (
+          entries.length === 1 &&
+          /\.zip$/i.test(entries[0].file?.name || "")
+        ) {
+          setGbakiStatus("Lecture du dossier…");
+          entries = await collectFromZip(entries[0].file);
+        }
+      }
+      const parsed = parseFolderStructure(entries);
+      if (!parsed || parsed.items.length === 0) {
+        setGbakiStatus("Aucun document trouvé.");
+        return;
+      }
+      setGbakiStatus("");
+      setBatchModal(parsed);
+    } catch (e) {
+      setGbakiStatus(`Erreur : ${e.message || e}`);
+    }
+  }
+
+  async function confirmBatch({ matiere, items, verifyPass: vp }) {
+    setBatchModal(null);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setVerifyPass(vp);
+    setBatchProgress({
+      current: 0,
+      total: items.length,
+      ok: 0,
+      failed: 0,
+      currentTitle: "",
+    });
+
+    let okCount = 0;
+    const failed = [];
+
+    for (let i = 0; i < items.length; i++) {
+      if (controller.signal.aborted) {
+        for (let j = i; j < items.length; j++) {
+          failed.push({
+            titre: items[j].titre,
+            type: items[j].type,
+            file: items[j].file,
+            reason: "Annulé",
+          });
+        }
+        break;
+      }
+      const it = items[i];
+      setBatchProgress((p) => ({
+        ...p,
+        current: i + 1,
+        currentTitle: `${it.titre} (${it.type})`,
+      }));
+      const draft = await addItem({
+        matiere,
+        type: it.type,
+        titre: it.titre,
+        source: "upload",
+      });
+      setCurrentItemId(draft.id);
+      lastErrorRef.current = "";
+      const result = await processFiles([it.file]);
+
+      if (result?.markdown) {
+        await updateItem(draft.id, {
+          markdown: result.markdown,
+          sourceImages: result.sourceImages,
+        });
+        okCount++;
+        setBatchProgress((p) => ({ ...p, ok: p.ok + 1 }));
+        classifyDocument(result.markdown).then(async (cls) => {
+          if (cls?.theme) {
+            const cur = await getItem(draft.id);
+            if (cur && !cur.theme) {
+              await updateItem(draft.id, { theme: cls.theme });
+              await refreshBase();
+            }
+          }
+        });
+      } else {
+        await deleteItem(draft.id);
+        failed.push({
+          titre: it.titre,
+          type: it.type,
+          file: it.file,
+          reason: lastErrorRef.current || "Erreur",
+        });
+        setBatchProgress((p) => ({ ...p, failed: p.failed + 1 }));
+        if (controller.signal.aborted) {
+          for (let j = i + 1; j < items.length; j++) {
+            failed.push({
+              titre: items[j].titre,
+              type: items[j].type,
+              file: items[j].file,
+              reason: "Annulé",
+            });
+          }
+          break;
+        }
+      }
+      await refreshBase();
+    }
+
+    abortRef.current = null;
+    setBatchProgress(null);
+    setCurrentItemId(null);
+    setMarkdown("");
+    setSourceImages([]);
+    setStatus(
+      `${okCount} document(s) ajouté(s)${failed.length > 0 ? ` · ${failed.length} échec(s)` : ""}.`,
+    );
+    if (failed.length > 0)
+      setBatchSummary({ ok: okCount, failed, matiere, verifyPass: vp });
+  }
+
+  function cancelBatch() {
+    setBatchModal(null);
+  }
+
+  async function retryBatchFailed(itemsToRetry) {
+    if (!batchSummary || !itemsToRetry?.length) return;
+    const { matiere, verifyPass: vp } = batchSummary;
+    setBatchSummary(null);
+    await confirmBatch({ matiere, items: itemsToRetry, verifyPass: vp });
+  }
+
+  function handleFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    const primary = files[0];
+    const baseName = primary.name.replace(/\.[^.]+$/, "");
+    setAddModal({
+      file: primary,
+      allFiles: files,
+      gbakiManifestItem: null,
+      defaults: {
+        titre: baseName,
+        matiere: currentItem?.matiere || "",
+        type: "cours",
+        annee: "",
+      },
+    });
+  }
+
+  async function openGbakiItem(manifestItem) {
+    if (busy) return;
+    const existing = await findByGbakiRef(manifestItem.id);
+    if (existing?.markdown) {
+      await openBaseItem(existing);
+      return;
+    }
+    try {
+      setGbakiStatus(`Chargement de « ${manifestItem.titre} »…`);
+      const r = await fetch(manifestItem.pdf);
+      if (!r.ok) throw new Error(`Document introuvable.`);
+      const blob = await r.blob();
+      const file = new File([blob], `${manifestItem.titre}.pdf`, {
+        type: "application/pdf",
+      });
+      setGbakiStatus("");
+      setAddModal({
+        file,
+        allFiles: [file],
+        gbakiManifestItem: manifestItem,
+        defaults: {
+          titre: manifestItem.titre,
+          matiere: manifestItem.matiere,
+          type: normalizeType(manifestItem.type),
+          annee: manifestItem.annee,
+        },
+      });
+    } catch (e) {
+      setGbakiStatus(String(e.message || e));
+    }
+  }
+
+  async function confirmAdd(meta) {
+    const { titre, matiere, type, annee, pageFrom, pageTo } = meta;
+    const allFiles = addModal.allFiles;
+    const gbakiRef = addModal.gbakiManifestItem?.id || null;
+    const source = gbakiRef ? "gbaki" : "upload";
+    setAddModal(null);
+    const draft = await addItem({
+      matiere,
+      type,
+      titre,
+      annee,
+      source,
+      gbakiRef,
+    });
+    setCurrentItemId(draft.id);
+    await refreshBase();
+    const result = await processFiles(allFiles, {
+      pageRange: { from: pageFrom, to: pageTo },
+    });
+    if (result?.markdown) {
+      await updateItem(draft.id, {
+        markdown: result.markdown,
+        sourceImages: result.sourceImages,
+      });
+      await refreshBase();
+      classifyDocument(result.markdown).then(async (cls) => {
+        if (!cls) return;
+        const cur = await getItem(draft.id);
+        if (!cur) return;
+        const updates = {};
+        if (
+          cls.matiere &&
+          (cur.matiere === "Sans matière" || !cur.matiere.trim())
+        )
+          updates.matiere = cls.matiere;
+        if (cls.theme && !cur.theme) updates.theme = cls.theme;
+        if (Object.keys(updates).length > 0) {
+          await updateItem(draft.id, updates);
+          await refreshBase();
+          setStatus(
+            `Détecté : ${[cls.matiere, cls.theme].filter(Boolean).join(" · ")}`,
+          );
+        }
+      });
+    } else {
+      await deleteItem(draft.id);
+      setCurrentItemId(null);
+      setMarkdown("");
+      setSourceImages([]);
+      await refreshBase();
+    }
+  }
+
+  function cancelAdd() {
+    setAddModal(null);
+  }
+
+  async function openBaseItem(item) {
+    if (busy) return;
+    setCurrentItemId(item.id);
+    setLastOpenedItemId(item.id);
+    setMarkdown(item.markdown || "");
+    setSourceImages(item.sourceImages || []);
+    setProgress(1);
+    setStatus(`« ${item.titre} » ouvert.`);
+  }
+
+  function editBaseItem(item) {
+    setEditModal(item);
+  }
+
+  async function saveEditedItem(patch) {
+    if (!editModal) return;
+    await updateItem(editModal.id, patch);
+    setEditModal(null);
+    await refreshBase();
+  }
+
+  async function deleteBaseItem(item) {
+    if (
+      !window.confirm(
+        `Supprimer « ${item.titre} » ?\n\nCette action est définitive.`,
+      )
+    )
+      return;
+    await deleteItem(item.id);
+    if (currentItemId === item.id) {
+      setCurrentItemId(null);
+      setMarkdown("");
+      setSourceImages([]);
+      setStatus("");
+    }
+    if (lastOpenedItemId === item.id) setLastOpenedItemId(null);
+    setSel((s) => s.filter((sid) => sid !== `base:${item.id}`));
+    await refreshBase();
+  }
+
+  async function deleteFromEdit() {
+    if (!editModal) return;
+    const it = editModal;
+    setEditModal(null);
+    await deleteBaseItem(it);
+  }
+
+  async function reocrBaseItem(item) {
+    if (busy || !item.gbakiRef) return;
+    if (
+      !window.confirm(
+        `Retranscrire « ${item.titre} » ?\n\nTes modifications seront perdues.`,
+      )
+    )
+      return;
+    const manifestItem = (gbaki || []).find((g) => g.id === item.gbakiRef);
+    if (!manifestItem) {
+      setGbakiStatus("Document source introuvable.");
+      return;
+    }
+    await deleteItem(item.id);
+    if (currentItemId === item.id) {
+      setCurrentItemId(null);
+      setMarkdown("");
+      setSourceImages([]);
+    }
+    await refreshBase();
+    await openGbakiItem(manifestItem);
+  }
+
+  function closeCurrent() {
+    setCurrentItemId(null);
+    setMarkdown("");
+    setSourceImages([]);
+    setProgress(0);
+    setStatus("");
+  }
+
+  function importMd(text) {
+    if (!text) return;
+    setMarkdown(text);
+    setStatus(
+      currentItemId
+        ? "Transcription importée."
+        : "Ouvre d'abord un document pour importer un .md.",
+    );
+  }
+
+  async function prepareSelection() {
+    const items = [];
+    const missing = [];
+    for (const sid of sel) {
+      if (sid.startsWith("base:")) {
+        const id = sid.slice(5);
+        const it = await getItem(id);
+        if (it?.markdown) items.push(it);
+      } else if (sid.startsWith("gbaki:")) {
+        const id = sid.slice(6);
+        const existing = await findByGbakiRef(id);
+        if (existing?.markdown) {
+          items.push(existing);
+        } else {
+          const m = (gbaki || []).find((g) => g.id === id);
+          if (m) missing.push(m);
+        }
+      }
+    }
+    if (missing.length > 0) {
+      const proceed = window.confirm(
+        `${missing.length} document(s) à transcrire avant de continuer.`,
+      );
+      if (!proceed) return null;
+      for (let i = 0; i < missing.length; i++) {
+        const m = missing[i];
+        setGbakiStatus(`Transcription ${i + 1}/${missing.length} : ${m.titre}`);
+        try {
+          const r = await fetch(m.pdf);
+          if (!r.ok) throw new Error(`Document introuvable.`);
+          const blob = await r.blob();
+          const file = new File([blob], `${m.titre}.pdf`, {
+            type: "application/pdf",
+          });
+          const draft = await addItem({
+            matiere: m.matiere,
+            type: normalizeType(m.type),
+            titre: m.titre,
+            annee: m.annee,
+            source: "gbaki",
+            gbakiRef: m.id,
+          });
+          setCurrentItemId(draft.id);
+          const result = await processFiles([file]);
+          if (!result?.markdown) {
+            await deleteItem(draft.id);
+            setGbakiStatus(`Échec sur « ${m.titre} ».`);
+            await refreshBase();
+            return null;
+          }
+          await updateItem(draft.id, {
+            markdown: result.markdown,
+            sourceImages: result.sourceImages,
+          });
+          items.push(await getItem(draft.id));
+        } catch (e) {
+          setGbakiStatus(`Erreur : ${e.message || e}`);
+          return null;
+        }
+      }
+      await refreshBase();
+      setGbakiStatus("");
+    }
+    return items;
+  }
+
+  async function analyzeProf(itemsArg) {
+    const items = Array.isArray(itemsArg) ? itemsArg : await prepareSelection();
+    if (!items) return;
+    const examens = items.filter((it) => normalizeType(it.type) === "examen");
+    if (examens.length < 2) {
+      setGbakiStatus("Il faut au moins 2 examens.");
+      return;
+    }
+    const matieres = new Set(examens.map((it) => it.matiere));
+    if (matieres.size > 1) {
+      setGbakiStatus("Tous les examens doivent être de la même matière.");
+      return;
+    }
+    const docs = examens.map((it) => ({
+      titre: `${it.titre} (${it.annee || "s.d."})`,
+      markdown: it.markdown,
+    }));
+    setStudyPrompt(
+      buildProfAnalysisPrompt(docs, {
+        matiere: [...matieres][0] || "la matière",
+      }),
+    );
+    setStudyToolLabel("analyse-prof");
+    setGbakiStatus("");
+  }
+
+  async function rankTds(itemsArg) {
+    const items = Array.isArray(itemsArg) ? itemsArg : await prepareSelection();
+    if (!items) return;
+    const tds = items.filter((it) => normalizeType(it.type) === "td");
+    const exams = items.filter((it) => normalizeType(it.type) === "examen");
+    if (tds.length < 1 || exams.length < 1) {
+      setGbakiStatus("Il faut au moins 1 TD et 1 examen.");
+      return;
+    }
+    const matieres = new Set(items.map((it) => it.matiere));
+    if (matieres.size > 1) {
+      setGbakiStatus("Tous les documents doivent être de la même matière.");
+      return;
+    }
+    const tdsDoc = tds.map((it) => ({
+      titre: `${it.titre} (${it.annee || "s.d."})`,
+      markdown: it.markdown,
+    }));
+    const examsDoc = exams.map((it) => ({
+      titre: `${it.titre} (${it.annee || "s.d."})`,
+      markdown: it.markdown,
+      annee: it.annee,
+    }));
+    setStudyPrompt(
+      buildTdsRankingPrompt(tdsDoc, examsDoc, {
+        matiere: [...matieres][0] || "la matière",
+      }),
+    );
+    setStudyToolLabel("ranker-tds");
+    setGbakiStatus("");
+  }
+
+  async function startQuiz(itemsArg) {
+    const items = Array.isArray(itemsArg) ? itemsArg : await prepareSelection();
+    if (!items) return;
+    const cours = items.filter((it) => normalizeType(it.type) === "cours");
+    if (cours.length === 0) {
+      setGbakiStatus("Sélectionne au moins un cours.");
+      return;
+    }
+    const matieres = new Set(cours.map((it) => it.matiere));
+    if (matieres.size > 1) {
+      setGbakiStatus("Tous les cours doivent être de la même matière.");
+      return;
+    }
+    const matiere = [...matieres][0] || "la matière";
+    const coursText = cours
+      .map((c) =>
+        cours.length > 1 ? `# ${c.titre}\n\n${c.markdown}` : c.markdown,
+      )
+      .join("\n\n---\n\n");
+    setStudyPrompt("");
+    setStudyToolLabel("");
+    setGbakiStatus("");
+    const init = {
+      cours: coursText,
+      matiere,
+      total: QUIZ_TOTAL,
+      currentIdx: 0,
+      questions: [],
+      status: "loading",
+    };
+    setQuiz(init);
+    const q = await quizQuestion({ cours: coursText, matiere, history: [] });
+    if (q?.error || !q?.question) {
+      setGbakiStatus(`Quiz indisponible : ${q?.error || "réponse invalide"}.`);
+      setQuiz(null);
+      return;
+    }
+    setQuiz({
+      ...init,
+      questions: [{ question: q.question, type: q.type }],
+      status: "asking",
+    });
+  }
+
+  async function submitQuizAnswer(userAnswer) {
+    if (!quiz || quiz.status !== "asking") return;
+    const idx = quiz.currentIdx;
+    setQuiz((s) => ({
+      ...s,
+      status: "evaluating",
+      questions: s.questions.map((q, i) =>
+        i === idx ? { ...q, userAnswer } : q,
+      ),
+    }));
+    const cq = quiz.questions[idx];
+    const ev = await quizEvaluate({
+      cours: quiz.cours,
+      matiere: quiz.matiere,
+      question: cq.question,
+      userAnswer,
+    });
+    if (ev?.error || !ev?.kind) {
+      setQuiz((s) => ({ ...s, status: "asking" }));
+      setGbakiStatus(`Correction impossible. Réessaie.`);
+      return;
+    }
+    setQuiz((s) => ({
+      ...s,
+      status: "feedback",
+      questions: s.questions.map((q, i) =>
+        i === idx
+          ? {
+              ...q,
+              kind: ev.kind,
+              score: typeof ev.score === "number" ? ev.score : 0,
+              feedback: String(ev.feedback || ""),
+              ideal: String(ev.ideal || ""),
+            }
+          : q,
+      ),
+    }));
+  }
+
+  async function nextQuizQuestion() {
+    if (!quiz) return;
+    const nextIdx = quiz.currentIdx + 1;
+    if (nextIdx >= quiz.total) {
+      setQuiz((s) => ({ ...s, status: "done" }));
+      return;
+    }
+    setQuiz((s) => ({ ...s, currentIdx: nextIdx, status: "loading" }));
+    const q = await quizQuestion({
+      cours: quiz.cours,
+      matiere: quiz.matiere,
+      history: quiz.questions,
+    });
+    if (q?.error || !q?.question) {
+      setQuiz((s) => ({ ...s, status: "done" }));
+      return;
+    }
+    setQuiz((s) => ({
+      ...s,
+      questions: [...s.questions, { question: q.question, type: q.type }],
+      status: "asking",
+    }));
+  }
+
+  function restartQuiz() {
+    startQuiz();
+  }
+  function exitQuiz() {
+    setQuiz(null);
+  }
+
+  async function onMatiereAction(matiere, action) {
+    const items = baseItems.filter(
+      (it) => it.matiere === matiere && (it.markdown || "").trim(),
+    );
+    if (items.length === 0) {
+      setGbakiStatus(`Aucun document transcrit pour « ${matiere} ».`);
+      return;
+    }
+    switch (action) {
+      case "analyzeProf":
+        return analyzeProf(items);
+      case "rankTds":
+        return rankTds(items);
+      case "plan":
+        return planRevision("", items);
+      case "quiz":
+        return startQuiz(items);
+    }
+  }
+
+  async function handleExport() {
+    try {
+      setGbakiStatus("Préparation de l'export…");
+      const blob = await exportBaseAsZip();
+      const date = new Date().toISOString().slice(0, 10);
+      downloadBlob(blob, `corro-${date}.zip`);
+      setGbakiStatus(`Export prêt (${(blob.size / 1024).toFixed(0)} Ko).`);
+    } catch (e) {
+      setGbakiStatus(`Export : ${e.message || e}`);
+    }
+  }
+
+  async function handleImport(file) {
+    if (!file) return;
+    try {
+      setGbakiStatus(`Import en cours…`);
+      const res = await importBaseFromZip(file);
+      await refreshBase();
+      const parts = [`${res.added} document(s) importé(s)`];
+      if (res.skippedExisting > 0)
+        parts.push(`${res.skippedExisting} déjà présent(s)`);
+      if (res.skippedMissingFile > 0)
+        parts.push(`${res.skippedMissingFile} fichier(s) manquant(s)`);
+      setGbakiStatus(parts.join(" · "));
+    } catch (e) {
+      setGbakiStatus(`Import : ${e.message || e}`);
+    }
+  }
+
+  function exportQuizAsPrompt() {
+    if (!quiz) return;
+    const prompt = buildQuizExportPrompt(quiz.cours, {
+      matiere: quiz.matiere,
+      n: 12,
+    });
+    setStudyPrompt(prompt);
+    setStudyToolLabel("quiz-export");
+    setQuiz(null);
+  }
+
+  async function planRevision(targetDate, itemsArg) {
+    const items = Array.isArray(itemsArg) ? itemsArg : await prepareSelection();
+    if (!items) return;
+    if (items.length === 0) {
+      setGbakiStatus("Sélectionne au moins un document.");
+      return;
+    }
+    const matieres = new Set(items.map((it) => it.matiere));
+    if (matieres.size > 1) {
+      setGbakiStatus("Tous les documents doivent être de la même matière.");
+      return;
+    }
+    const docs = items.map((it) => ({
+      titre: it.titre,
+      annee: it.annee,
+      type: normalizeType(it.type),
+      markdown: it.markdown,
+    }));
+    setStudyPrompt(
+      buildRevisionPlanPrompt(docs, {
+        matiere: [...matieres][0] || "la matière",
+        targetDate: targetDate || "",
+      }),
+    );
+    setStudyToolLabel("plan-revision");
+    setGbakiStatus("");
+  }
+
+  function buildBatches(allPages) {
+    const batches = [];
+    let cur = [],
+      curSize = 0;
+    for (const p of allPages) {
+      if (p.kind === "text") {
+        if (cur.length) {
+          batches.push({ kind: "ocr", pages: cur });
           cur = [];
           curSize = 0;
         }
-        cur.push(img);
-        curSize += img.length;
+        batches.push({ kind: "text", page: p });
+        continue;
       }
-      if (cur.length) batches.push(cur);
+      if (
+        cur.length &&
+        (cur.length >= BATCH_SIZE || curSize + p.dataUrl.length > MAX_PAYLOAD)
+      ) {
+        batches.push({ kind: "ocr", pages: cur });
+        cur = [];
+        curSize = 0;
+      }
+      cur.push(p);
+      curSize += p.dataUrl.length;
+    }
+    if (cur.length) batches.push({ kind: "ocr", pages: cur });
+    return batches;
+  }
 
-      const total = images.length;
-      let done = 0;
-      let result = "";
-      for (let b = 0; b < batches.length; b++) {
-        const batch = batches[b];
-        const label = `pages ${done + 1}–${done + batch.length} / ${total}`;
-
-        setStatus(`Transcription : ${label}…`);
-        let md = await ocrWithRetry({ images: batch });
-
-        if (verifyPass) {
-          await sleep(DELAY_MS);
-          setStatus(`Relecture des formules : ${label}…`);
-          const verified = await ocrWithRetry({ images: batch, draft: md });
-          if (verified.trim()) md = verified;
+  async function processFiles(files, opts = {}) {
+    if (!files || files.length === 0) return null;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(true);
+    setMarkdown("");
+    setSourceImages([]);
+    setProgress(0);
+    count429.current = 0;
+    setAutoVerifyDisabled(false);
+    const singlePdf = files.length === 1 && files[0].type === "application/pdf";
+    const pageRange = singlePdf ? opts.pageRange : undefined;
+    try {
+      setStatus("Ouverture du fichier…");
+      let allPages = [];
+      for (const f of files) {
+        if (controller.signal.aborted)
+          throw new DOMException("Annulé", "AbortError");
+        const pages =
+          f.type === "application/pdf"
+            ? await renderPdf(f, {
+                onPage: (i, n, kind) =>
+                  setStatus(
+                    kind === "text"
+                      ? `Page ${i} — texte natif`
+                      : `Préparation page ${i}…`,
+                  ),
+                signal: controller.signal,
+                pageRange,
+              })
+            : await renderImage(f);
+        allPages = allPages.concat(pages);
+      }
+      const imgs = allPages
+        .filter((p) => p.kind === "image")
+        .map((p) => p.dataUrl);
+      setSourceImages(imgs);
+      for (const p of allPages) {
+        if (p.kind !== "image") continue;
+        let guard = 0;
+        while (p.dataUrl.length > MAX_PAYLOAD && guard < 3) {
+          setStatus(`Compression page ${p.index}…`);
+          p.dataUrl = await shrinkImage(p.dataUrl);
+          guard++;
         }
-
+      }
+      const batches = buildBatches(allPages);
+      const total = allPages.length;
+      let pagesDone = 0,
+        result = "";
+      for (let b = 0; b < batches.length; b++) {
+        if (controller.signal.aborted)
+          throw new DOMException("Annulé", "AbortError");
+        const batch = batches[b];
+        let md;
+        if (batch.kind === "text") {
+          md = batch.page.text;
+          setStatus(`Page ${batch.page.index} — texte natif.`);
+          pagesDone += 1;
+        } else {
+          const from = batch.pages[0].index;
+          const to = batch.pages[batch.pages.length - 1].index;
+          const span = from === to ? `page ${from}` : `pages ${from}–${to}`;
+          setStatus(`Transcription ${span}…`);
+          md = await ocrWithRetry(
+            { images: batch.pages.map((p) => p.dataUrl) },
+            controller.signal,
+          );
+          if (verifyPass && !autoVerifyDisabled) {
+            await sleep(DELAY_MS, controller.signal);
+            setStatus(`Relecture des formules ${span}…`);
+            const verified = await ocrWithRetry(
+              { images: batch.pages.map((p) => p.dataUrl), draft: md },
+              controller.signal,
+            );
+            if (verified.trim()) md = verified;
+          }
+          pagesDone += batch.pages.length;
+        }
         result += (result ? "\n\n---\n\n" : "") + md.trim();
         setMarkdown(result);
-        done += batch.length;
-        setProgress(done / total);
-        if (b < batches.length - 1) await sleep(DELAY_MS);
+        setProgress(pagesDone / total);
+        if (batch.kind === "ocr" && b < batches.length - 1)
+          await sleep(DELAY_MS, controller.signal);
       }
-      setStatus(`Terminé : ${total} page(s). Relis les formules avant de réviser.`);
+      const txt = allPages.filter((p) => p.kind === "text").length;
+      setStatus(
+        txt > 0
+          ? `Terminé — ${total} page(s), ${txt} en texte natif.`
+          : `Terminé — ${total} page(s). Vérifie les formules avant de copier.`,
+      );
+      return { markdown: result, sourceImages: imgs };
     } catch (e) {
-      setStatus(`Erreur : ${e.message || e}`);
+      const msg =
+        e?.name === "AbortError" ? "Annulé." : `Erreur : ${e.message || e}`;
+      lastErrorRef.current = msg;
+      setStatus(msg);
+      return null;
     } finally {
       setBusy(false);
-      if (fileRef.current) fileRef.current.value = "";
+      abortRef.current = null;
     }
   }
 
-  async function ocrWithRetry(payload, attemptNo = 0, useFallback = false) {
+  async function ocrWithRetry(payload, signal, attemptNo = 0, engineIdx = 0) {
+    if (signal?.aborted) throw new DOMException("Annulé", "AbortError");
+    if (engineIdx >= OCR_CHAIN.length)
+      throw new Error(
+        "Tous les moteurs sont saturés. Réessaie dans 1h ou configure ta clé personnelle.",
+      );
+    const engine = OCR_CHAIN[engineIdx];
     let r;
     try {
       r = await fetch("/api/ocr", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...payload, useFallback }),
+        headers: {
+          "Content-Type": "application/json",
+          ...userKeyHeaders(userKeys),
+        },
+        body: JSON.stringify({ ...payload, engine }),
+        signal,
       });
-    } catch {
-      if (attemptNo < 5) {
-        setStatus(`Connexion interrompue — nouvelle tentative dans 8 s… (${attemptNo + 1}/5)`);
-        await sleep(8000);
-        return ocrWithRetry(payload, attemptNo + 1, useFallback);
-      }
-      throw new Error("Échec réseau répété. Vérifie ta connexion et garde l'onglet ouvert.");
-    }
-
-    if (r.status === 429 && attemptNo < 5) {
-      const info = await r.json().catch(() => ({}));
-      if (info.daily) {
-        if (!useFallback) {
-          setStatus("Quota journalier du modèle principal épuisé — bascule sur Flash-Lite…");
-          await sleep(2000);
-          return ocrWithRetry(payload, attemptNo + 1, true);
-        }
-        throw new Error(
-          "Quota journalier gratuit épuisé sur les deux modèles (réinitialisation vers 7h-8h)."
-        );
-      }
-      setStatus(`Quota par minute atteint, nouvelle tentative dans 30 s… (${attemptNo + 1}/5)`);
-      await sleep(30000);
-      return ocrWithRetry(payload, attemptNo + 1, useFallback);
-    }
-
-    if (r.status === 503 && attemptNo < 5) {
-      const nextFallback = useFallback || attemptNo >= 2;
-      const wait = Math.min(40000, 10000 * 2 ** Math.min(attemptNo, 2));
-      setStatus(
-        `Serveurs surchargés (503) — tentative ${attemptNo + 1}/5 dans ${wait / 1000} s` +
-          (nextFallback ? " (modèle de repli)" : "")
-      );
-      await sleep(wait);
-      return ocrWithRetry(payload, attemptNo + 1, nextFallback);
-    }
-
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.error || `Erreur OCR (${r.status})`);
-    return data.markdown || "";
-  }
-
-  /* ---------- analyse intégrée ---------- */
-  async function ask(presetQuestion) {
-    const q = (presetQuestion ?? question).trim();
-    if (!q || !markdown.trim() || streaming) return;
-    setQuestion("");
-    setChat((c) => [...c, { role: "user", content: q }, { role: "assistant", content: "" }]);
-    setStreaming(true);
-    try {
-      const r = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider, mode, markdown, question: q,
-          history: chat.filter((m) => m.content),
-        }),
-      });
-      if (!r.ok || !r.body) {
-        const data = await r.json().catch(() => ({}));
-        throw new Error(data.error || `Erreur (${r.status})`);
-      }
-      const reader = r.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop();
-        for (const line of lines) {
-          const t = line.trim();
-          if (!t.startsWith("data:")) continue;
-          const payload = t.slice(5).trim();
-          if (payload === "[DONE]") continue;
-          try {
-            const delta = JSON.parse(payload)?.choices?.[0]?.delta?.content || "";
-            if (delta) {
-              setChat((c) => {
-                const copy = [...c];
-                copy[copy.length - 1] = {
-                  role: "assistant",
-                  content: copy[copy.length - 1].content + delta,
-                };
-                return copy;
-              });
-            }
-          } catch { /* fragment incomplet */ }
-        }
-      }
     } catch (e) {
-      setChat((c) => {
-        const copy = [...c];
-        copy[copy.length - 1] = { role: "assistant", content: `⚠️ ${e.message || e}` };
-        return copy;
-      });
-    } finally {
-      setStreaming(false);
+      if (e?.name === "AbortError") throw e;
+      if (attemptNo < 5) {
+        setStatus(
+          `Connexion interrompue — nouvelle tentative (${attemptNo + 1}/5)…`,
+        );
+        await sleep(8000, signal);
+        return ocrWithRetry(payload, signal, attemptNo + 1, engineIdx);
+      }
+      throw new Error("Échec réseau. Vérifie ta connexion.");
     }
+    if (r.status === 501) {
+      const info = await r.json().catch(() => ({}));
+      if (info.needsKey && engineIdx === 0) setSaturatedShared(true);
+      return ocrWithRetry(payload, signal, 0, engineIdx + 1);
+    }
+    if (r.status === 429) {
+      count429.current += 1;
+      if (!userKeys.gemini && count429.current >= 2) setSaturatedShared(true);
+      if (count429.current >= 3 && verifyPass && !autoVerifyDisabled)
+        setAutoVerifyDisabled(true);
+      const info = await r.json().catch(() => ({}));
+      if (info.daily || attemptNo >= 3) {
+        setStatus(`Quota atteint — passage au moteur suivant…`);
+        await sleep(1500, signal);
+        return ocrWithRetry(payload, signal, 0, engineIdx + 1);
+      }
+      setStatus(`Quota atteint — pause 30 s (${attemptNo + 1}/3)…`);
+      await sleep(30000, signal);
+      return ocrWithRetry(payload, signal, attemptNo + 1, engineIdx);
+    }
+    if (r.status === 503) {
+      if (attemptNo >= 2) {
+        setStatus(`Moteur surchargé — passage au suivant…`);
+        await sleep(1500, signal);
+        return ocrWithRetry(payload, signal, 0, engineIdx + 1);
+      }
+      const wait = 10000 * 2 ** attemptNo;
+      setStatus(`Serveurs surchargés — pause ${wait / 1000} s…`);
+      await sleep(wait, signal);
+      return ocrWithRetry(payload, signal, attemptNo + 1, engineIdx);
+    }
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `Erreur (${r.status})`);
+    return data.markdown || "";
   }
 
   function download(name, content, type = "text/markdown") {
@@ -312,261 +1109,264 @@ export default function Home() {
     URL.revokeObjectURL(a.href);
   }
 
-  async function copyPrompt() {
+  async function copyText(text, tag) {
     try {
       if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(correctionPrompt);
+        await navigator.clipboard.writeText(text);
       } else {
-        // Contexte non sécurisé (http hors localhost) : l'API clipboard est désactivée.
-        // Méthode de secours : zone de texte temporaire + execCommand.
         const ta = document.createElement("textarea");
-        ta.value = correctionPrompt;
+        ta.value = text;
         ta.style.position = "fixed";
         ta.style.opacity = "0";
         document.body.appendChild(ta);
         ta.focus();
         ta.select();
-        const ok = document.execCommand("copy");
+        document.execCommand("copy");
         ta.remove();
-        if (!ok) throw new Error("copy refusée");
       }
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2500);
+      setCopied(tag);
+      setTimeout(() => setCopied(""), 2500);
     } catch {
-      // Dernier recours : on aide l'utilisateur à copier manuellement.
-      alert(
-        "Copie automatique indisponible dans ce contexte. Le texte va être sélectionné : fais Ctrl+C (ou Cmd+C)."
-      );
-      const box = document.querySelector(".promptbox");
-      if (box) {
-        box.focus();
-        box.select();
-      }
+      alert("Copie indisponible — sélectionne le texte et fais Ctrl+C.");
     }
   }
 
-  /* ---------- rendu ---------- */
   return (
-    <main>
+    <main className="app">
+      {/* ── En-tête ── */}
       <header className="hero">
         <div className="hero-inner">
-          <p className="tag">Copia · atelier de révision</p>
+          <div className="hero-top">
+            <p className="tag">Corro AI</p>
+            <div className="hero-top-actions">
+              <button
+                type="button"
+                className={`mode-btn ${userKeys.gemini ? "mode-perso" : "mode-shared"}`}
+                onClick={() => {
+                  setSettingsFocus(userKeys.gemini ? null : "gemini");
+                  setSettingsOpen(true);
+                }}
+                title={
+                  userKeys.gemini
+                    ? "Clé personnelle active — quota dédié"
+                    : "Mode partagé — quota mutualisé"
+                }
+              >
+                <span className="mode-dot" />
+                {userKeys.gemini ? "Mode perso" : "Mode partagé"}
+              </button>
+              <button
+                type="button"
+                className="help-btn"
+                onClick={() => setHelpOpen(true)}
+                aria-label="Comment ça marche"
+              >
+                Comment ça marche ?
+              </button>
+            </div>
+          </div>
+
           <h1>
-            Tes cours scannés, prêts à être <em>travaillés</em>.
+            Tes cours. Tes TDs.
+            <br />
+            Prêts à être <em>travaillés</em>.
           </h1>
           <p>
-            Dépose un poly ou des photos de TD — même mal scannés. Copia les transcrit en
-            Markdown (formules comprises), puis t'aide à réviser : résumé, fiche, quiz, et
-            corrigés d'expert pour les sujets sans correction.
+            Dépose un scan — même flou, même en photo. Corro le transcrit et
+            t&apos;aide à réviser.
           </p>
-          <div className="meta">
-            <span>OCR double passe</span>
-            <span>LaTeX préservé</span>
-            <span>100 % gratuit</span>
-          </div>
         </div>
       </header>
 
-      <div className="sheet">
-        {/* 01 — Import */}
-        <section className="copy">
-          <div className="ex">
-            <span className="num">01</span>
-            <h2>Dépose ton document</h2>
+      {/* ── Bandeau quota saturé ── */}
+      {saturatedShared && !userKeys.gemini && (
+        <div className="saturation-banner">
+          <div className="saturation-inner">
+            <strong>Quota atteint.</strong> Ajoute ta clé gratuite pour
+            continuer sans attente.
+            <button
+              className="primary sm"
+              onClick={() => {
+                setSettingsFocus("gemini");
+                setSettingsOpen(true);
+              }}
+            >
+              Ajouter ma clé
+            </button>
+            <button
+              className="ghost sm"
+              onClick={() => setSaturatedShared(false)}
+            >
+              Plus tard
+            </button>
           </div>
-          <p className="sub">PDF scanné ou photos de pages — plusieurs fichiers possibles.</p>
+        </div>
+      )}
 
-          <div
-            className={`drop ${over ? "over" : ""}`}
-            role="button"
-            tabIndex={0}
-            onClick={() => !busy && fileRef.current?.click()}
-            onKeyDown={(e) => e.key === "Enter" && !busy && fileRef.current?.click()}
-            onDragOver={(e) => { e.preventDefault(); setOver(true); }}
-            onDragLeave={() => setOver(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setOver(false);
-              if (!busy) handleFiles(e.dataTransfer.files);
-            }}
-          >
-            {I.up}
-            <p className="big">{busy ? "Traitement en cours…" : "Clique ou glisse tes fichiers ici"}</p>
-            <p className="small">PDF · JPG · PNG · WebP</p>
-          </div>
-          <input
-            ref={fileRef}
-            type="file"
-            accept="application/pdf,image/jpeg,image/png,image/webp"
-            multiple
-            hidden
-            disabled={busy}
-            onChange={(e) => handleFiles(e.target.files)}
+      {/* ── Corps principal ── */}
+      <div className="layout">
+        <Sidebar
+          baseItems={baseItems}
+          gbakiManifest={gbaki}
+          currentItemId={currentItemId}
+          selectedIds={sel}
+          onToggleSelect={toggleSel}
+          onOpenBase={openBaseItem}
+          onEditBase={editBaseItem}
+          onDeleteBase={deleteBaseItem}
+          onReocrBase={reocrBaseItem}
+          onOpenGbaki={openGbakiItem}
+          onExportBase={handleExport}
+          onImportBase={handleImport}
+          status={gbakiStatus}
+          busy={busy}
+        />
+
+        <div className="main">
+          <Dropzone
+            busy={busy}
+            status={status}
+            progress={progress}
+            verifyPass={verifyPass}
+            autoVerifyDisabled={autoVerifyDisabled}
+            batchProgress={batchProgress}
+            onFiles={handleFiles}
+            onFolderOrZip={handleFolderOrZip}
+            onCancel={cancelOcr}
+            onToggleVerify={setVerifyPass}
           />
 
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={verifyPass}
-              disabled={busy}
-              onChange={(e) => setVerifyPass(e.target.checked)}
+          <ToolsPanel
+            baseItems={baseItems}
+            gbakiManifest={gbaki}
+            selectedIds={sel}
+            studyPrompt={studyPrompt}
+            studyToolLabel={studyToolLabel}
+            onClearSelection={clearSelection}
+            onAnalyzeProf={() => analyzeProf()}
+            onRankTds={() => rankTds()}
+            onPlanRevision={(date) => planRevision(date)}
+            onQuizCours={() => startQuiz()}
+            onCopy={copyText}
+            onDownload={download}
+            copiedTag={copied}
+            busy={busy}
+          />
+
+          {quiz ? (
+            <QuizPanel
+              quiz={quiz}
+              onSubmit={submitQuizAnswer}
+              onNext={nextQuizQuestion}
+              onRestart={restartQuiz}
+              onExit={exitQuiz}
+              onExport={exportQuizAsPrompt}
             />
-            <span>
-              Relecture des formules (2ᵉ passe) — recommandé pour les scans de qualité moyenne.
-              Deux fois plus lent, deux fois plus fiable sur les maths.
-            </span>
-          </label>
-
-          {(busy || status) && (
-            <div className="status" aria-live="polite">
-              <div className="bar"><div className="fill" style={{ width: `${progress * 100}%` }} /></div>
-              <p className="mono">{status}</p>
-            </div>
-          )}
-        </section>
-
-        {/* 02 — Markdown */}
-        {markdown && (
-          <section className="copy">
-            <div className="toolbar">
-              <div className="ex">
-                <span className="num">02</span>
-                <h2>Ta transcription</h2>
-              </div>
-              <button className="ghost" onClick={() => download("cours.md", markdown)}>
-                {I.dl} Télécharger le .md
-              </button>
-            </div>
-            <p className="sub">Relis surtout les formules — corrige directement ici si besoin.</p>
-            <textarea
-              className="mdbox"
-              value={markdown}
-              onChange={(e) => setMarkdown(e.target.value)}
-              rows={15}
-              spellCheck={false}
-            />
-          </section>
-        )}
-
-        {/* 03 — Réviser */}
-        {markdown && (
-          <section className="copy">
-            <div className="ex">
-              <span className="num">03</span>
-              <h2>Révise avec l'IA</h2>
-            </div>
-            <p className="sub">Résumé, fiche, quiz — générés à partir de ton document uniquement.</p>
-
-            <div className="fields">
-              <label className="field">
-                <span>Modèle</span>
-                <select value={provider} onChange={(e) => setProvider(e.target.value)}>
-                  {PROVIDERS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}
-                </select>
-              </label>
-              <label className="field">
-                <span>Que veux-tu générer ?</span>
-                <select value={mode} onChange={(e) => setMode(e.target.value)}>
-                  {MODES.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
-                </select>
-              </label>
-              <div className="field" style={{ display: "flex", alignItems: "flex-end" }}>
-                <button
-                  className="primary"
-                  disabled={streaming}
-                  onClick={() => ask("Lance-toi : applique le mode sélectionné à l'ensemble du document.")}
-                >
-                  Générer
+          ) : markdown ? (
+            <>
+              <Workbench
+                markdown={markdown}
+                setMarkdown={setMarkdown}
+                sourceImages={sourceImages}
+                currentItem={currentItem}
+                onDownload={download}
+                onImportMd={importMd}
+              />
+              <CorrectionPanel
+                markdown={markdown}
+                subject={subject}
+                setSubject={setSubject}
+                attempt={attempt}
+                setAttempt={setAttempt}
+                onCopy={copyText}
+                onDownload={download}
+                copiedTag={copied}
+              />
+              <div className="reset-row">
+                <button className="ghost" onClick={closeCurrent}>
+                  Fermer ce document
                 </button>
               </div>
-            </div>
-
-            <div className="chat">
-              {chat.length === 0 && (
-                <p className="empty">Choisis un mode et clique sur « Générer », ou pose une question.</p>
-              )}
-              {chat.map((m, i) => (
-                <div key={i} className={`msg ${m.role}`}>
-                  <pre>{m.content || "…"}</pre>
-                </div>
-              ))}
-            </div>
-
-            <div className="askrow">
-              <input
-                type="text"
-                value={question}
-                placeholder="Pose une question sur ton cours…"
-                onChange={(e) => setQuestion(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && ask()}
-              />
-              <button className="primary" onClick={() => ask()} disabled={streaming || !question.trim()}>
-                {streaming ? "…" : "Envoyer"}
-              </button>
-            </div>
-          </section>
-        )}
-
-        {/* 04 — Correction experte (copie "professeur") */}
-        {markdown && (
-          <section className="copy prof">
-            <div className="ex">
-              <span className="num">04</span>
-              <h2>Corrige un sujet sans corrigé</h2>
-            </div>
-            <p className="sub">
-              Pour la fiabilité des calculs, la correction passe par DeepSeek (mode DeepThink)
-              ou Claude — gratuits via leur site, bien plus forts que les API gratuites.
-              Le prompt ci-dessous contient déjà ton sujet et la méthode de correction.
-            </p>
-
-            <div className="fields">
-              <label className="field">
-                <span>Matière (précise le rôle de l'expert)</span>
-                <input type="text" value={subject} onChange={(e) => setSubject(e.target.value)} />
-              </label>
-            </div>
-            <label className="field" style={{ display: "block", marginBottom: 18 }}>
-              <span>Ta tentative (optionnel — elle sera évaluée avant le corrigé)</span>
-              <textarea
-                value={attempt}
-                onChange={(e) => setAttempt(e.target.value)}
-                rows={4}
-                placeholder="Colle ton brouillon de solution ici…"
-              />
-            </label>
-
-            <textarea className="promptbox" value={correctionPrompt} readOnly rows={8} />
-
-            <div className="btnrow">
-              <button className="ghost" onClick={copyPrompt}>
-                {I.copy} {copied ? "Copié ✓" : "Copier le prompt"}
-              </button>
-              <button
-                className="ghost"
-                onClick={() => download("prompt-correction.txt", correctionPrompt, "text/plain")}
-              >
-                {I.dl} Télécharger (.txt)
-              </button>
-              <a className="btn ghost" href="https://chat.deepseek.com" target="_blank" rel="noreferrer">
-                DeepSeek {I.out}
-              </a>
-              <a className="btn ghost" href="https://claude.ai/new" target="_blank" rel="noreferrer">
-                Claude {I.out}
-              </a>
-            </div>
-            <p className="mono" style={{ marginTop: 14 }}>
-              Astuce : active DeepThink (R1) dans DeepSeek pour les calculs. Prompt trop long
-              pour le collage ? Télécharge le .txt et joins-le comme fichier.
-            </p>
-          </section>
-        )}
+            </>
+          ) : (
+            <Dashboard
+              baseItems={baseItems}
+              lastOpenedItemId={lastOpenedItemId}
+              onMatiereAction={onMatiereAction}
+              onOpenItem={openBaseItem}
+              busy={busy}
+            />
+          )}
+        </div>
       </div>
 
+      {/* ── Modales ── */}
+      {addModal && (
+        <AddItemModal
+          file={addModal.file}
+          defaults={addModal.defaults}
+          matiereSuggestions={matiereSuggestions}
+          onCancel={cancelAdd}
+          onConfirm={confirmAdd}
+        />
+      )}
+      {editModal && (
+        <EditItemModal
+          item={editModal}
+          matiereSuggestions={matiereSuggestions}
+          onCancel={() => setEditModal(null)}
+          onSave={saveEditedItem}
+          onDelete={deleteFromEdit}
+        />
+      )}
+      {batchModal && (
+        <BatchImportModal
+          parsed={batchModal}
+          matiereSuggestions={matiereSuggestions}
+          onCancel={cancelBatch}
+          onConfirm={confirmBatch}
+        />
+      )}
+      {batchSummary && (
+        <BatchSummaryModal
+          ok={batchSummary.ok}
+          failed={batchSummary.failed}
+          matiere={batchSummary.matiere}
+          onClose={() => setBatchSummary(null)}
+          onRetry={retryBatchFailed}
+        />
+      )}
+      {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
+      {welcomeOpen && (
+        <WelcomeModal
+          onConfigure={async () => {
+            await markOnboardingDone();
+            setWelcomeOpen(false);
+            setSettingsFocus("gemini");
+            setSettingsOpen(true);
+          }}
+          onLater={async () => {
+            await markOnboardingDone();
+            setWelcomeOpen(false);
+          }}
+        />
+      )}
+      {settingsOpen && (
+        <Settings
+          focusProvider={settingsFocus}
+          onClose={() => {
+            setSettingsOpen(false);
+            setSettingsFocus(null);
+            reloadKeys().then(() => setSaturatedShared(false));
+          }}
+          onChange={reloadKeys}
+        />
+      )}
+
+      {/* ── Pied de page ── */}
       <footer>
-        Quotas gratuits variables selon les fournisseurs. Les offres gratuites peuvent utiliser
-        tes données pour l'entraînement : pas de documents sensibles. Et vérifie toujours un
-        corrigé d'IA — même les meilleurs modèles se trompent parfois.
+        Corro AI · Tes données restent dans ton navigateur. Gratuit. Sans
+        compte.
       </footer>
     </main>
   );
